@@ -238,7 +238,9 @@ async def put_judgments(sid: str, body: JudgmentsBody):
         {"a": a, "b": b, "type": t} for (a, b), t in merged.items()
     ]
     sess["version"] += 1
-    return {"version": sess["version"], "judgments": body.judgments}
+    # 返回服务端实际存储的判断（同一对框以后到者为准、已去重），
+    # 便于调用方确认页面状态与服务端一致
+    return {"version": sess["version"], "judgments": sess["judgments"]}
 
 
 class ParamsBody(BaseModel):

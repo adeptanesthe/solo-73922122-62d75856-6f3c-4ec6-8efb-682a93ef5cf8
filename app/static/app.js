@@ -12,7 +12,7 @@ const state = {
   version: 0,
   nFrames: 0,
   detections: [],
-  judgments: [],          // [{a, b, type}]，a/b 为框号
+  judgments: [],          // [{a, b, type}]，a/b 为框号（乐观更新：点击即改，保存失败再回滚）
   params: { w_dist: 1, w_app: 10000, penalty: 15000 },
   images: [],             // HTMLImageElement
   currentFrame: 0,
@@ -20,6 +20,9 @@ const state = {
   result: null,           // 当前展示的求解结果
   jobId: null,
   pollTimer: null,
+  saveChain: Promise.resolve(), // 判断/参数保存串行队列：按用户操作顺序逐个提交
+  saveGen: 0,             // 会话切换或保存失败时 +1，用于取消仍在排队的保存
+  pendingSaves: 0,        // 已发起、服务端尚未确认的保存数量（>0 时不得展示任务结果）
 };
 
 const $ = (id) => document.getElementById(id);
@@ -73,6 +76,10 @@ function loadSession(payload) {
   state.result = null;
   state.jobId = null;
   if (state.pollTimer) { clearTimeout(state.pollTimer); state.pollTimer = null; }
+  state.saveGen += 1;                   // 旧会话排队中的保存全部作废
+  state.saveChain = Promise.resolve();  // 新会话使用全新保存队列
+  // 注意：不重置 pendingSaves —— 旧会话在途的保存 settle 时仍会递减它，
+  // 重置会破坏计数平衡；其副作用由任务内的会话一致性检查拦截。
 
   state.images = [];
   for (let i = 0; i < state.nFrames; i++) {
@@ -238,47 +245,91 @@ function toggleSelect(id) {
   draw();
 }
 
-async function setJudgment(type) {
-  if (state.selection.length !== 2) return;
+/* ---------------------------------------------------- 保存队列（判断/参数共用）
+
+   所有会改变服务端输入的保存都经 enqueueSave 串行提交：
+   - 入队（即用户发起修改）时立即撤下旧计数；
+   - 请求按用户操作顺序逐个发出，前一个响应到达后才发下一个，
+     因此服务端最后保存的必为用户最后一次操作，页面快照也按同一顺序生成；
+   - 保存未确认期间（pendingSaves > 0），pollJob 不展示任何任务结果；
+   - 任一保存失败：提示用户、取消后续排队保存，并从服务端重新同步，
+     保证页面判断/参数与服务端一致。 */
+function enqueueSave(label, run) {
+  invalidateResult(); // 修改一发起就撤下旧计数
+  const sid = state.sessionId;
+  const gen = state.saveGen;
+  state.pendingSaves += 1;
+  const task = async () => {
+    try {
+      if (gen !== state.saveGen) return; // 已被取消（会话切换或前序保存失败）
+      try {
+        await run(sid);
+      } catch (err) {
+        if (sid !== state.sessionId) return; // 旧会话的失败无需处理
+        state.saveGen += 1; // 取消后续排队保存，避免覆盖刚同步的状态
+        alert(`${label}失败：${err.message}`);
+        await resyncFromServer();
+      }
+    } finally {
+      state.pendingSaves -= 1;
+    }
+  };
+  state.saveChain = state.saveChain.then(task, task);
+  return state.saveChain;
+}
+
+async function resyncFromServer() {
+  try {
+    const payload = await api(`/api/sessions/${state.sessionId}`);
+    if (payload.session_id !== state.sessionId) return;
+    state.version = payload.version;
+    state.judgments = payload.judgments;
+    state.params = payload.params;
+    $("p-wdist").value = payload.params.w_dist;
+    $("p-wapp").value = payload.params.w_app;
+    $("p-penalty").value = payload.params.penalty;
+    renderJudgments();
+    renderSelection();
+    draw();
+  } catch (err) {
+    showError("session-info",
+      new Error(`保存失败后同步会话状态出错：${err.message}；请刷新页面重试。`));
+  }
+}
+
+function submitJudgments(next, label) {
+  const sid = state.sessionId;
+  // 乐观更新：立即反映到页面；快速连续改判都基于最新页面状态生成完整快照
+  state.judgments = next;
+  renderJudgments();
+  renderSelection();
+  draw();
+  const snapshot = next.map((j) => ({ a: j.a, b: j.b, type: j.type }));
+  enqueueSave(label, async () => {
+    const resp = await api(`/api/sessions/${sid}/judgments`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ judgments: snapshot }),
+    });
+    if (sid !== state.sessionId) return; // 会话已切换，忽略旧响应
+    state.version = resp.version;
+  });
+}
+
+function setJudgment(type) {
+  if (state.selection.length !== 2 || !state.sessionId) return;
   const [a, b] = state.selection;
   const key = pairKey(a, b);
   const rest = state.judgments.filter((j) => pairKey(j.a, j.b) !== key);
   const next = type ? [...rest, { a, b, type }] : rest;
-  invalidateResult(); // 修改即撤下旧结果
-  try {
-    const resp = await api(`/api/sessions/${state.sessionId}/judgments`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ judgments: next }),
-    });
-    state.version = resp.version;
-    state.judgments = next;
-    renderJudgments();
-    renderSelection();
-    draw();
-  } catch (err) {
-    alert(`保存判断失败：${err.message}`);
-  }
+  submitJudgments(next, type ? "保存判断" : "清除判断");
 }
 
-async function removeJudgment(a, b) {
+function removeJudgment(a, b) {
+  if (!state.sessionId) return;
   const key = pairKey(a, b);
   const next = state.judgments.filter((j) => pairKey(j.a, j.b) !== key);
-  invalidateResult();
-  try {
-    const resp = await api(`/api/sessions/${state.sessionId}/judgments`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ judgments: next }),
-    });
-    state.version = resp.version;
-    state.judgments = next;
-    renderJudgments();
-    renderSelection();
-    draw();
-  } catch (err) {
-    alert(`删除判断失败：${err.message}`);
-  }
+  submitJudgments(next, "删除判断");
 }
 
 function renderJudgments() {
@@ -304,7 +355,7 @@ function renderJudgments() {
 
 /* ------------------------------------------------------------ 参数 */
 
-async function applyParams() {
+function applyParams() {
   if (!state.sessionId) return;
   const wDist = parseFloat($("p-wdist").value);
   const wApp = parseFloat($("p-wapp").value);
@@ -313,18 +364,18 @@ async function applyParams() {
     alert("参数必须是有限非负数。");
     return;
   }
-  invalidateResult(); // 修改即撤下旧结果
-  try {
-    const resp = await api(`/api/sessions/${state.sessionId}/params`, {
+  const sid = state.sessionId;
+  const params = { w_dist: wDist, w_app: wApp, penalty };
+  state.params = params; // 乐观更新；保存失败时由 resyncFromServer 回滚
+  enqueueSave("保存参数", async () => {
+    const resp = await api(`/api/sessions/${sid}/params`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ w_dist: wDist, w_app: wApp, penalty }),
+      body: JSON.stringify(params),
     });
+    if (sid !== state.sessionId) return; // 会话已切换，忽略旧响应
     state.version = resp.version;
-    state.params = { w_dist: wDist, w_app: wApp, penalty };
-  } catch (err) {
-    alert(`保存参数失败：${err.message}`);
-  }
+  });
 }
 
 /* ------------------------------------------------------------ 求解 */
@@ -347,6 +398,11 @@ async function solve() {
   status.classList.add("muted");
   status.style.color = "";
   try {
+    if (state.pendingSaves > 0) {
+      // 先等待在途的判断/参数保存完成：本次求解必须基于最后一次成功保存的输入
+      status.textContent = "正在保存未完成的判断/参数修改…";
+      while (state.pendingSaves > 0) await state.saveChain;
+    }
     const resp = await api(`/api/sessions/${state.sessionId}/solve`, { method: "POST" });
     state.jobId = resp.job_id;
     status.textContent = `计算中（输入版本 v${resp.version}）… 可继续修改判断与参数。`;
@@ -369,6 +425,11 @@ async function pollJob(jobId) {
     if (job.status === "error") {
       status.textContent = job.error || "求解失败。";
       status.style.color = "#ff9d97";
+      return;
+    }
+    if (state.pendingSaves > 0) {
+      // 有判断/参数保存尚未确认：不得展示旧任务结果，稍后再按最新版本判定
+      state.pollTimer = setTimeout(() => pollJob(jobId), 150);
       return;
     }
     if (job.version !== state.version) {

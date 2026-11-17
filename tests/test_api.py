@@ -174,6 +174,119 @@ def test_params_validation():
     assert r.status_code == 422
 
 
+# ---------------------------------------------------------------- 连续改判与求解交接
+
+def make_chain_session():
+    """三框一条链：a(f0)-b(f1)-c(f2)，外观相同、位置接近。
+    无判断时全局最优为 1 条轨迹；a、c 判异只后必须拆成 2 条。"""
+    dets = [
+        {"id": "a", "frame": 0, "rect": [0, 0, 8, 8], "vector": [1, 0]},
+        {"id": "b", "frame": 1, "rect": [10, 0, 8, 8], "vector": [1, 0]},
+        {"id": "c", "frame": 2, "rect": [20, 0, 8, 8], "vector": [1, 0]},
+    ]
+    return make_session(n_imgs=3, dets=dets)
+
+
+def solve_count(sid):
+    job = client.post(f"/api/sessions/{sid}/solve").json()
+    done = wait_job(job["job_id"])
+    assert done["status"] == "done" and done["result"]["feasible"]
+    return done["result"]["animal_count"]
+
+
+def test_rapid_rejudgment_last_save_wins():
+    """快速对同一对框先标同只再标异只（按用户操作顺序依次保存）：
+    服务端以最后一次成功保存为准，下一次求解随之变化。"""
+    p = make_chain_session()
+    sid = p["session_id"]
+    assert solve_count(sid) == 1  # 无判断：一条链
+
+    r1 = client.put(f"/api/sessions/{sid}/judgments",
+                    json={"judgments": [{"a": "a", "b": "c", "type": "same"}]})
+    assert r1.status_code == 200
+    r2 = client.put(f"/api/sessions/{sid}/judgments",
+                    json={"judgments": [{"a": "a", "b": "c", "type": "different"}]})
+    assert r2.status_code == 200
+    assert r2.json()["version"] == r1.json()["version"] + 1
+    cur = client.get(f"/api/sessions/{sid}").json()
+    assert cur["judgments"] == [{"a": "a", "b": "c", "type": "different"}]
+    assert solve_count(sid) == 2  # 异只判断生效：链被拆开
+
+    # 再改回同只：最后一次保存再次生效，计数恢复 1
+    client.put(f"/api/sessions/{sid}/judgments",
+               json={"judgments": [{"a": "a", "b": "c", "type": "same"}]})
+    assert solve_count(sid) == 1
+
+
+def test_solve_started_before_judgment_save_goes_stale():
+    """求解启动后、判断保存完成前：旧任务结果携带旧版本号（页面不得展示）；
+    下一次求解以最后保存的判断为准。"""
+    p = make_chain_session()
+    sid = p["session_id"]
+    job1 = client.post(f"/api/sessions/{sid}/solve").json()
+    assert job1["version"] == 1
+    r = client.put(f"/api/sessions/{sid}/judgments",
+                   json={"judgments": [{"a": "a", "b": "c", "type": "different"}]})
+    assert r.json()["version"] == 2
+
+    done1 = wait_job(job1["job_id"])
+    assert done1["version"] == 1  # 旧任务基于保存前的输入
+    assert done1["result"]["animal_count"] == 1  # 旧计数，页面须作废不展示
+    cur = client.get(f"/api/sessions/{sid}").json()
+    assert cur["version"] == 2 and cur["judgments"][0]["type"] == "different"
+
+    job2 = client.post(f"/api/sessions/{sid}/solve").json()
+    assert job2["version"] == 2  # 下一次求解基于最后保存的判断
+    done2 = wait_job(job2["job_id"])
+    assert done2["result"]["animal_count"] == 2
+
+
+def test_rapid_param_changes_last_save_wins():
+    """快速连续修改参数：版本单调递增，服务端以最后一次保存为准。"""
+    p = make_session()
+    sid = p["session_id"]
+    r1 = client.put(f"/api/sessions/{sid}/params",
+                    json={"w_dist": 2.0, "w_app": 50.0, "penalty": 100.0})
+    r2 = client.put(f"/api/sessions/{sid}/params",
+                    json={"w_dist": 3.0, "w_app": 60.0, "penalty": 200.0})
+    assert (r1.json()["version"], r2.json()["version"]) == (2, 3)
+    cur = client.get(f"/api/sessions/{sid}").json()
+    assert cur["version"] == 3
+    assert cur["params"] == {"w_dist": 3.0, "w_app": 60.0, "penalty": 200.0}
+
+
+def test_failed_judgment_save_leaves_server_state_unchanged():
+    """保存失败（引用不存在的框）：不推进版本、不改变已存判断，
+    页面失败后可据此重新同步到与服务端一致的状态。"""
+    p = make_session()
+    sid = p["session_id"]
+    ok = client.put(f"/api/sessions/{sid}/judgments",
+                    json={"judgments": [{"a": "a", "b": "b", "type": "same"}]})
+    assert ok.status_code == 200
+    v = ok.json()["version"]
+    bad = client.put(f"/api/sessions/{sid}/judgments",
+                     json={"judgments": [{"a": "a", "b": "ghost", "type": "different"}]})
+    assert bad.status_code == 400
+    cur = client.get(f"/api/sessions/{sid}").json()
+    assert cur["version"] == v
+    assert cur["judgments"] == [{"a": "a", "b": "b", "type": "same"}]
+
+
+def test_judgments_response_reflects_stored_state():
+    """PUT 响应返回服务端实际存储的判断：同一对框重复出现时以后到者为准。"""
+    p = make_session()
+    sid = p["session_id"]
+    r = client.put(f"/api/sessions/{sid}/judgments",
+                   json={"judgments": [
+                       {"a": "a", "b": "b", "type": "same"},
+                       {"a": "b", "b": "a", "type": "different"},
+                   ]})
+    assert r.status_code == 200
+    assert r.json()["judgments"] == [{"a": "a", "b": "b", "type": "different"}]
+    cur = client.get(f"/api/sessions/{sid}").json()
+    assert cur["judgments"] == r.json()["judgments"]
+
+
 def test_unknown_session_404():
     assert client.get("/api/sessions/nope").status_code == 404
     assert client.post("/api/sessions/nope/solve").status_code == 404
